@@ -10,8 +10,10 @@ import time
 from pprint import pformat
 
 import face_recognition
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, \
-    precision_score
+import torch
+from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
+                             classification_report,
+                             precision_score)
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.neural_network import MLPClassifier
 from tqdm import tqdm
@@ -22,17 +24,131 @@ from utils.util import dump_dataset, load_image_file
 log = logging.getLogger()
 
 
+class AdaptiveLinear(torch.nn.Module):
+    def __init__(self, in_features, out_features, dim=1, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.dim = dim
+        self.weight = torch.nn.Parameter(torch.ones(*self.weight_size))
+        self.bias = torch.nn.Parameter(torch.zeros(out_features)) if bias else None
+
+    @staticmethod
+    def _remove_idx(old_tensor, new_size, idx):
+        new_size[0] = new_size[0] - 1
+        new_tensor = torch.ones(*new_size)
+        new_tensor[:idx] = old_tensor[:idx]
+        new_tensor[idx:] = old_tensor[idx + 1:]
+        return new_tensor
+
+    @staticmethod
+    def _add_output(old_tensor, new_size, other):
+        new_size[0] = new_size[0] + other
+        new_tensor = torch.randn(*new_size)
+        new_tensor[:old_tensor.size(0)] = old_tensor[:]
+        return new_tensor
+
+    def _change_outputs(self, function, parameter_name, dim, *args):
+        old_tensor = getattr(self, parameter_name)
+        old_tensor = old_tensor.transpose(0, dim)
+        new_tensor = function(old_tensor, list(old_tensor.size()), *args)
+        new_tensor = new_tensor.transpose(0, dim)
+        setattr(self, parameter_name, new_tensor)
+
+    def change_outputs(self, function, weight_dim, bias_dim, *args):
+        self._change_outputs(function, 'weight', weight_dim, *args)
+        if self.bias is not None:
+            self._change_outputs(function, 'bias', bias_dim, *args)
+
+    def __delitem__(self, idx):
+        self.change_outputs(self._remove_idx, 1, 0, idx)
+
+    def __add__(self, other):
+        self.change_outputs(self._add_output, 1, 0, other)
+        return self
+
+    def forward(self, module_input: torch.Tensor):
+        module_input = module_input.transpose(self.dim, -1)
+        base_view = [1] * (len(module_input.size()) - 1)
+        weight = self.weight.view(*base_view, self.in_features, self.out_features)
+        module_input = module_input.unsqueeze(-1)
+        output = module_input * weight
+        output = output.sum(dim=-2)
+        if self.bias is not None:
+            bias = self.bias.view(*base_view, self.out_features)
+            output = output + bias
+        return output
+
+
+class Swish(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, function_input):
+        ctx.save_for_backward(function_input)
+        sigmoid = function_input.sigmoid()
+        sigmoid.mul_(function_input)
+        return sigmoid
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x = ctx.saved_tensors
+        e_x = x.exp()
+        e_x_1 = e_x + 1
+        out = e_x_1 + x
+        out.mul_(e_x)
+        e_x_1.pow_(2)
+        out.div_(e_x_1)
+        out.mul_(grad_output)
+        return out
+
+
+class ClassificationModel:
+    def __init__(self, inputs, *neuron_counts, batch_norm=True, activation=Swish.apply,
+                 bias=False, dense_net=False):
+        super().__init__()
+        self.dense_net = dense_net
+        self.layer_list = [[]]
+        input_count = inputs
+        for i, neurons in enumerate(neuron_counts[:-1]):
+            layer = torch.nn.Linear(input_count, neurons, bias=bias)
+            input_count = input_count + neurons if dense_net else neurons
+
+            setattr(self, f'dense_{i}', layer)
+            self.layer_list.append([layer])
+            if batch_norm:
+                setattr(self, f'norm_{i}', torch.nn.BatchNorm1d(neurons))
+                self.layer_list[-1].append(layer)
+            setattr(self, f'activation_{i}', activation)
+            self.layer_list[-1].append(layer)
+
+        self.classifier = AdaptiveLinear(input_count, neuron_counts[-1])
+
+    def forward(self, model_input):
+        for group in self.layer_list:
+            prev_input = model_input
+            for layer in group:
+                model_input = layer(model_input)
+            if self.dense_net:
+                model_input = torch.cat([prev_input, model_input], dim=-1)
+        output = self.classifier(model_input)
+        return output
+
+
 class Classifier():
     """
     Store the knowledge related to the people faces
     """
 
-    def __init__(self):
+    def __init__(self, epochs=5, device=None):
         self.training_dir = None
         self.model_path = None
         self.peoples_list = []
         self.classifier = None
         self.parameters = {}
+        self.epochs = epochs
+        self.device = device if device is not None else (
+                torch.device('gpu:0') if torch.cuda.is_available() else torch.device(
+                    'cpu'))
+        self.batch_size = 16192
 
     def init_classifier(self):
         """
@@ -40,26 +156,26 @@ class Classifier():
         """
         if self.classifier is None:
             log.debug("init_classifier | START!")
-            if len(self.parameters) > 0:
-                log.debug("init_classifier | Initializing a new classifier ... | {0}".format(
+            if not self.parameters:
+                raise ValueError("init_classifier | Mandatory parameter not provided | "
+                                 "Init a new KNN Classifier")
+            log.debug("init_classifier | Initializing a new classifier ... |" + str(
                     pformat(self.__dict__)))
-                self.classifier = MLPClassifier(**self.parameters)
-            else:
-                log.error(
-                    "init_classifier | Mandatory parameter not provided | Init a new KNN Classifier")
-                self.classifier = MLPClassifier()
+            self.classifier = ClassificationModel(**self.parameters)
 
     def load_classifier_from_file(self, timestamp):
         """
         Initialize the classifier from file.
-        The classifier file represent the name of the directory related to the classifier that we want to load.
+        The classifier file represent the name of the directory related to the
+        classifier that we want to load.
 
         The tree structure of the the model folder will be something like this
 
          Structure:
         model/
         ├── <20190520_095119>/  --> Timestamp in which the model was created
-        │   ├── model.dat       -->  Dataset generated by encoding the faces and pickelizing them
+        │   ├── model.dat       -->  Dataset generated by encoding the faces and
+        pickelizing them
         │   ├── model.clf       -->  Classifier delegated to recognize a given face
         │   ├── model.json      -->  Hyperparameters related to the current classifier
         ├── <20190519_210950>/
@@ -72,7 +188,9 @@ class Classifier():
         :return:
         """
         log.debug(
-            "load_classifier_from_file | Loading classifier from file ... | File: {}".format(timestamp))
+                "load_classifier_from_file | Loading classifier from file ... | File: "
+                "{}".format(
+                        timestamp))
 
         # Load a trained KNN model (if one was passed in)
         err = None
@@ -82,18 +200,27 @@ class Classifier():
             # Adding the conventional name used for the classifier -> 'model.clf'
             filename = os.path.join(self.model_path, timestamp, "model.clf")
             log.debug(
-                "load_classifier_from_file | Loading classifier from file: {}".format(filename))
+                    "load_classifier_from_file | Loading classifier from file: {"
+                    "}".format(
+                            filename))
             if os.path.isfile(filename):
                 log.debug(
-                    "load_classifier_from_file | File {} exist! Loading classifier ...".format(filename))
+                        "load_classifier_from_file | File {} exist! Loading "
+                        "classifier ...".format(
+                                filename))
                 with open(filename, 'rb') as f:
                     self.classifier = pickle.load(f)
                 log.debug("load_classifier_from_file | Classifier loaded!")
             else:
-                err = "load_classifier_from_file | FATAL | File {} DOES NOT EXIST ...".format(filename)
+                err = "load_classifier_from_file | FATAL | File {} DOES NOT EXIST " \
+                      "...".format(
+                        filename)
         if err is not None:
-            log.error("load_classifier_from_file | ERROR: {} | Seems that the model is gone :/ |"
-                      " Loading an empty classifier for training purpose ...".format(err))
+            log.error(
+                    "load_classifier_from_file | ERROR: {} | Seems that the model is "
+                    "gone "
+                    ":/ |"
+                    " Loading an empty classifier for training purpose ...".format(err))
             self.classifier = None
 
     def train(self, X, Y, timestamp):
@@ -111,22 +238,27 @@ class Classifier():
 
         start_time = time.time()
 
-        X_train, x_test, Y_train, y_test = train_test_split(
-            X, Y, test_size=0.25)
+        train_input, test_input, train_output, test_output = train_test_split(
+                X, Y, test_size=0.25)
 
         log.debug("train | Training ...")
-        self.classifier.fit(X_train, Y_train)
+        loss = torch.nn.BCEWithLogitsLoss()
+        for _ in range(self.epochs):
+            pass  # TODO: Train
+        self.classifier.fit(train_input, train_output)
         log.debug("train | Model Trained!")
         log.debug("train | Checking performance ...")
-        y_pred = self.classifier.predict(x_test)
+        y_pred = self.classifier.predict(test_input)
         # Static method
-        self.verify_performance(y_test, y_pred)
+        self.verify_performance(test_output, y_pred)
 
-        return self.dump_model(timestamp=timestamp, classifier=self.classifier), time.time() - start_time
+        return self.dump_model(timestamp=timestamp,
+                               classifier=self.classifier), time.time() - start_time
 
     def tuning(self, X, Y, timestamp):
         """
-        Tune the hyperparameter of a new model by the given data [X] related to the given target [Y]
+        Tune the hyperparameter of a new model by the given data [X] related to the
+        given target [Y]
 
         :param X:
         :param Y:
@@ -137,16 +269,16 @@ class Classifier():
         dump_dataset(X, Y, os.path.join(self.model_path, timestamp))
 
         X_train, x_test, Y_train, y_test = train_test_split(
-            X, Y, test_size=0.25)
+                X, Y, test_size=0.25)
         self.classifier = MLPClassifier(max_iter=250)
         # Hyperparameter of the neural network (MLP) to tune
         # Faces are encoded using 128 points
         parameter_space = {
-            'hidden_layer_sizes': [(128,), (200,), (200, 128,), ],
-            'activation': ['identity', 'tanh', 'relu'],
-            'solver': ['adam'],
-            'learning_rate': ['constant', 'adaptive'],
-        }
+                'hidden_layer_sizes': [(128,), (200,), (200, 128,), ],
+                'activation':         ['identity', 'tanh', 'relu'],
+                'solver':             ['adam'],
+                'learning_rate':      ['constant', 'adaptive'],
+                }
         log.debug("tuning | Parameter -> {}".format(pformat(parameter_space)))
         grid = GridSearchCV(self.classifier, parameter_space,
                             cv=2, scoring='accuracy', verbose=20, n_jobs=8)
@@ -158,12 +290,13 @@ class Classifier():
         y_pred = grid.predict(x_test)
 
         log.info('Results on the test set: {}'.format(
-            pformat(grid.score(x_test, y_test))))
+                pformat(grid.score(x_test, y_test))))
 
         self.verify_performance(y_test, y_pred)
 
         return self.dump_model(timestamp=timestamp, params=grid.best_params_,
-                               classifier=grid.best_estimator_), time.time() - start_time
+                               classifier=grid.best_estimator_), time.time() - \
+               start_time
 
     @staticmethod
     def verify_performance(y_test, y_pred):
@@ -176,13 +309,13 @@ class Classifier():
 
         log.debug("verify_performance | Analyzing performance ...")
         log.info("\nClassification Report: {}".format(
-            pformat(classification_report(y_test, y_pred))))
+                pformat(classification_report(y_test, y_pred))))
         log.info("balanced_accuracy_score: {}".format(
-            pformat(balanced_accuracy_score(y_test, y_pred))))
+                pformat(balanced_accuracy_score(y_test, y_pred))))
         log.info("accuracy_score: {}".format(
-            pformat(accuracy_score(y_test, y_pred))))
+                pformat(accuracy_score(y_test, y_pred))))
         log.info("precision_score: {}".format(
-            pformat(precision_score(y_test, y_pred, average='weighted'))))
+                pformat(precision_score(y_test, y_pred, average='weighted'))))
 
     def dump_model(self, timestamp, classifier, params=None, path=None):
         """
@@ -199,7 +332,7 @@ class Classifier():
                 if os.path.exists(self.model_path) and os.path.isdir(self.model_path):
                     path = self.model_path
         config = {'classifier_file': os.path.join(timestamp, "model.clf"),
-                  'params': params
+                  'params':          params
                   }
         if not os.path.isdir(path):
             os.makedirs(timestamp)
@@ -207,25 +340,27 @@ class Classifier():
         classifier_file = os.path.join(classifier_folder, "model")
 
         log.debug("dump_model | Dumping model ... | Path: {} | Model folder: {}".format(
-            path, timestamp))
+                path, timestamp))
         if not os.path.exists(classifier_folder):
             os.makedirs(classifier_folder)
 
         with open(classifier_file + ".clf", 'wb') as f:
             pickle.dump(classifier, f)
             log.info('dump_model | Model saved to {0}.clf'.format(
-                classifier_file))
+                    classifier_file))
 
         with open(classifier_file + ".json", 'w') as f:
             json.dump(config, f)
             log.info('dump_model | Configuration saved to {0}.json'.format(
-                classifier_file))
+                    classifier_file))
 
         return config
 
-    def init_peoples_list(self, detection_model, jitters, encoding_models, peoples_path=None):
+    def init_peoples_list(self, detection_model, jitters, encoding_models,
+                          peoples_path=None):
         """
-        This method is delegated to iterate among the folder that contains the peoples's face in order to
+        This method is delegated to iterate among the folder that contains the
+        peoples's face in order to
         initialize the array of peoples
         :return:
         """
@@ -237,17 +372,21 @@ class Classifier():
             raise Exception("Dataset (peoples faces) path not provided :/")
         # The init process can be parallelized, but BATCH method will perform better
         # pool = ThreadPool(3)
-        # self.peoples_list = pool.map(self.init_peoples_list_core, os.listdir(self.training_dir))
+        # self.peoples_list = pool.map(self.init_peoples_list_core, os.listdir(
+        # self.training_dir))
 
         for people_name in tqdm(os.listdir(self.training_dir),
-                                total=len(os.listdir(self.training_dir)), desc="Init people list ..."):
+                                total=len(os.listdir(self.training_dir)),
+                                desc="Init people list ..."):
             self.peoples_list.append(
-                self.init_peoples_list_core(detection_model, jitters, encoding_models, people_name))
+                    self.init_peoples_list_core(detection_model, jitters,
+                                                encoding_models, people_name))
 
         self.peoples_list = list(
-            filter(None.__ne__, self.peoples_list))  # Remove None
+                filter(None.__ne__, self.peoples_list))  # Remove None
 
-    def init_peoples_list_core(self, detection_model, jitters, encoding_models, people_name):
+    def init_peoples_list_core(self, detection_model, jitters, encoding_models,
+                               people_name):
         """
         Delegated core method for parallelize operation
         :detection_model
@@ -257,7 +396,7 @@ class Classifier():
         """
         if os.path.isdir(os.path.join(self.training_dir, people_name)):
             log.debug("Initializing people {0}".format(
-                os.path.join(self.training_dir, people_name)))
+                    os.path.join(self.training_dir, people_name)))
             person = Person()
             person.name = people_name
             person.path = os.path.join(self.training_dir, people_name)
@@ -265,7 +404,7 @@ class Classifier():
             return person
 
         log.debug("People {0} invalid folder!".format(
-            os.path.join(self.training_dir, people_name)))
+                os.path.join(self.training_dir, people_name)))
         return None
 
     def init_dataset(self):
@@ -274,11 +413,11 @@ class Classifier():
         :return:
         """
         DATASET = {
-            # Image data (numpy array)
-            "X": [],
-            # Person name
-            "Y": []
-        }
+                # Image data (numpy array)
+                "X": [],
+                # Person name
+                "Y": []
+                }
 
         for people in self.peoples_list:
             log.debug(people.name)
@@ -303,14 +442,16 @@ class Classifier():
         try:
             # TODO: Reduce size of the image at every iteration
             X_face_locations = face_recognition.face_locations(
-                X_img, model=detection_model)  # model="cnn")
+                    X_img, model=detection_model)  # model="cnn")
         except RuntimeError:
             log.error(
-                "extract_face_from_image | GPU does not have enough memory: FIXME unload data and retry")
+                    "extract_face_from_image | GPU does not have enough memory: FIXME "
+                    "unload data and retry")
             return None, None, ratio
 
-        log.debug("extract_face_from_image | Found {} face(s) for the given image".format(
-            len(X_face_locations)))
+        log.debug(
+                "extract_face_from_image | Found {} face(s) for the given image".format(
+                        len(X_face_locations)))
 
         # If no faces are found in the image, return an empty result.
         if len(X_face_locations) == 0:
@@ -318,14 +459,21 @@ class Classifier():
             return -3, -3, ratio
 
         # Find encodings for faces in the test image
-        log.debug("extract_face_from_image | Encoding faces using [{}] jitters ...".format(jitters))
+        log.debug(
+                "extract_face_from_image | Encoding faces using [{}] jitters "
+                "...".format(
+                        jitters))
         # num_jitters increase the distortion check
         faces_encodings = face_recognition.face_encodings(
-            X_img, known_face_locations=X_face_locations, num_jitters=jitters, model=encoding_models)
-        log.debug("extract_face_from_image | Face encoded! | Let's ask to the neural network ...")
+                X_img, known_face_locations=X_face_locations, num_jitters=jitters,
+                model=encoding_models)
+        log.debug(
+                "extract_face_from_image | Face encoded! | Let's ask to the neural "
+                "network ...")
         return faces_encodings, X_face_locations, ratio
 
-    def predict(self, X_img_path: str, detection_model: str, jitters: int, encoding_models: str,
+    def predict(self, X_img_path: str, detection_model: str, jitters: int,
+                encoding_models: str,
                 distance_threshold: int = 0.45):
         """
         Recognizes faces in given image using a trained KNN classifier
@@ -333,15 +481,19 @@ class Classifier():
         :param detection_model: can be 'hog' (CPU) or 'cnn' (GPU)
         :param jitters: augmentation data (jitters=20 -> 20x time)
         :param X_img_path: path of the image to be recognized
-        :param distance_threshold: (optional) distance threshold for face classification. the larger it is,
+        :param distance_threshold: (optional) distance threshold for face
+        classification. the larger it is,
         the more chance of mis-classifying an unknown person as a known one.
-        :return: a list of names and face locations for the recognized faces in the image: [(name, bounding box), ...].
-                                        For faces of unrecognized persons, the name 'unknown' will be returned.
+        :return: a list of names and face locations for the recognized faces in the
+        image: [(name, bounding box), ...].
+                                        For faces of unrecognized persons, the name
+                                        'unknown' will be returned.
         """
 
         if self.classifier is None:
             log.error(
-                "predict | Be sure that you have loaded/trained the neural network model")
+                    "predict | Be sure that you have loaded/trained the neural "
+                    "network model")
             return None
 
         faces_encodings, X_face_locations = None, None
@@ -350,8 +502,9 @@ class Classifier():
         # FIXME: manage gpu memory unload in case of None
         ratio = 2
         while faces_encodings is None or X_face_locations is None:
-            faces_encodings, X_face_locations, ratio = Classifier.extract_face_from_image(
-                X_img_path, detection_model, jitters, encoding_models)
+            faces_encodings, X_face_locations, ratio = \
+                Classifier.extract_face_from_image(
+                        X_img_path, detection_model, jitters, encoding_models)
             # In this case return back the error to the caller
             if isinstance(faces_encodings, int):
                 return faces_encodings
@@ -360,21 +513,24 @@ class Classifier():
         log.debug("predict | Understanding peoples recognized from NN ...")
         closest_distances = self.classifier.predict(faces_encodings)
         log.debug("predict | Persons recognized: [{}]".format(
-            closest_distances))
+                closest_distances))
 
         log.debug("predict | Asking to the neural network for probability ...")
         predictions = self.classifier.predict_proba(faces_encodings)
         pred = []
         for prediction in predictions:
-            pred.append(dict([v for v in sorted(zip(self.classifier.classes_, prediction),
-                                                key=lambda c: c[1], reverse=True)[:len(closest_distances)]]))
+            pred.append(
+                    dict([v for v in sorted(zip(self.classifier.classes_, prediction),
+                                            key=lambda c: c[1], reverse=True)[
+                                     :len(closest_distances)]]))
         log.debug("predict | Predict proba -> {}".format(pred))
         face_prediction = []
         for i in range(len(pred)):
             element = list(pred[i].items())[0]
             log.debug("pred in cycle: {}".format(element))
             face_prediction.append(element)
-            # log.debug("predict | *****MIN****| {}".format(min(closest_distances[0][i])))
+            # log.debug("predict | *****MIN****| {}".format(min(closest_distances[0][
+            # i])))
         log.debug("Scores -> {}".format(face_prediction))
 
         _predictions = []
@@ -382,14 +538,17 @@ class Classifier():
         if len(face_prediction) > 0:
             for person_score, loc in zip(face_prediction, X_face_locations):
                 if person_score[1] < distance_threshold:
-                    log.warning("predict | Person {} does not outbounds threshold {}<{}".format(
-                        pred, person_score[1], distance_threshold))
+                    log.warning(
+                            "predict | Person {} does not outbounds threshold {}<{"
+                            "}".format(
+                                    pred, person_score[1], distance_threshold))
                 else:
                     log.debug("predict | Pred: {} | Loc: {} | Score: {}".format(
-                        person_score[0], loc, person_score[1]))
+                            person_score[0], loc, person_score[1]))
                     if ratio > 0:
                         log.debug(
-                            "predict | Fixing face location using ratio: {}".format(ratio))
+                                "predict | Fixing face location using ratio: {}".format(
+                                        ratio))
 
                         x1, y1, x2, y2 = loc
                         # 1200 < size < 1600
