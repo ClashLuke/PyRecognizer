@@ -11,8 +11,7 @@ from pprint import pformat
 
 import face_recognition
 import torch
-from sklearn.model_selection import GridSearchCV, train_test_split
-from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 from datastructure.Person import Person
@@ -119,6 +118,18 @@ class ClassificationModel(torch.nn.Module):
 
         self.classifier = AdaptiveLinear(input_count, neuron_counts[-1])
         self.loss = loss
+        self.init_weights()
+
+    def init_weights(self):
+        def init(module: torch.nn.Module):
+            if hasattr(module, "weight"):
+                if "norm" not in module.__class__.__name__.lower():
+                    torch.nn.init.orthogonal_(module.weight.data)
+                else:
+                    torch.nn.init.uniform_(module.weight.data, 0.998, 1.002)
+            if hasattr(module, "bias"):
+                torch.nn.init.constant_(module.bias.data, 0)
+        self.apply(init)
 
     def forward(self, model_input):
         for group in self.layer_list:
@@ -293,34 +304,50 @@ class Classifier:
         start_time = time.time()
         dump_dataset(X, Y, os.path.join(self.model_path, timestamp))
 
-        X_train, x_test, Y_train, y_test = train_test_split(
-                X, Y, test_size=0.25)
-        self.classifier = MLPClassifier(max_iter=250)
+        train_input, test_input, train_target, test_target = train_test_split(
+                X, Y, test_size=0.2)
+        train_input, valid_input, train_target, valid_target = train_test_split(train_input, train_target, test_size=0.125)
         # Hyperparameter of the neural network (MLP) to tune
         # Faces are encoded using 128 points
         parameter_space = {
-                'hidden_layer_sizes': [(128,), (200,), (200, 128,), ],
-                'activation':         ['identity', 'tanh', 'relu'],
-                'solver':             ['adam'],
-                'learning_rate':      ['constant', 'adaptive'],
+                'neuron_counts': [(128,), (200,), (200, 128,), ],
                 }
-        log.debug("tuning | Parameter -> {}".format(pformat(parameter_space)))
-        grid = GridSearchCV(self.classifier, parameter_space,
-                            cv=2, scoring='accuracy', verbose=20, n_jobs=8)
-        grid.fit(X_train, Y_train)
+        epochs = 1
+        def train(parameter_names:list, kwargs={}):
+            if not parameter_names:
+                classifier = ClassificationModel(**kwargs)
+                for _ in range(epochs):
+                    classifier.fit(train_input, train_target)
+                return classifier, classifier.evaluate(test_input, test_target)
+            loss = None
+            acc = None
+            best_param = None
+            best_classifier = None
+            param = parameter_names.pop(0)
+            for value in parameter_space[param]:
+                kwargs[param] = value
+                classifier, current_loss, current_acc, *params = train(parameter_names,
+                                                                       kwargs)
+                if loss is None or current_loss < loss or current_acc > acc:
+                    loss = current_acc
+                    acc = current_acc
+                    best_param = params + ((param, best_param),)
+                    best_classifier = classifier
+            return best_classifier, loss, acc, best_param
+
+        model, loss, acc, params = train(list(parameter_space.keys()))
+        params = dict(params)
         log.info("TUNING COMPLETE | DUMPING DATA!")
-        # log.info("tuning | Grid Scores: {}".format(pformat(grid.grid_scores_)))
-        log.info('Best parameters found: {}'.format(grid.best_params_))
+        log.info(f'Best Parameters: {params}')
+        log.info(f'Test-Loss: {loss:.5f} - Test-Accuracy: {acc:.5f}')
 
-        y_pred = grid.predict(x_test)
+        loss, acc = model.evaluate(valid_input, valid_target)
+        log.info(f"Valid-Loss: {loss} - Valid-Accuracy: {acc}")
+        self.classifier = model
 
-        log.info('Results on the test set: {}'.format(
-                pformat(grid.score(x_test, y_test))))
-
-
-        return self.dump_model(timestamp=timestamp, params=grid.best_params_,
-                               classifier=grid.best_estimator_), time.time() - \
-               start_time
+        return self.dump_model(timestamp=timestamp,
+                               params=params,
+                               classifier=model), time.time() - start_time
 
     @staticmethod
     def verify_performance(y_test, y_pred):
