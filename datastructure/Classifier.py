@@ -11,9 +11,6 @@ from pprint import pformat
 
 import face_recognition
 import torch
-from sklearn.metrics import (accuracy_score, balanced_accuracy_score,
-                             classification_report,
-                             precision_score)
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.neural_network import MLPClassifier
 from tqdm import tqdm
@@ -101,9 +98,9 @@ class Swish(torch.autograd.Function):
         return out
 
 
-class ClassificationModel:
+class ClassificationModel(torch.nn.Module):
     def __init__(self, inputs, *neuron_counts, batch_norm=True, activation=Swish.apply,
-                 bias=False, dense_net=False):
+                 bias=False, dense_net=False, loss=torch.nn.BCEWithLogitsLoss):
         super().__init__()
         self.dense_net = dense_net
         self.layer_list = [[]]
@@ -121,6 +118,7 @@ class ClassificationModel:
             self.layer_list[-1].append(layer)
 
         self.classifier = AdaptiveLinear(input_count, neuron_counts[-1])
+        self.loss = loss
 
     def forward(self, model_input):
         for group in self.layer_list:
@@ -132,8 +130,37 @@ class ClassificationModel:
         output = self.classifier(model_input)
         return output
 
+    def fit(self, inputs, targets=None):
+        self.requires_grad_(True)
+        mean_loss = 0
+        item_count = len(inputs)
+        if targets is not None:
+            inputs = zip(inputs, targets)
+        for src, tgt in inputs:
+            out = self.forward(src)
+            loss = self.loss(out, tgt)
+            loss.backward()
+            mean_loss += loss.item() / item_count
+        return mean_loss
 
-class Classifier():
+    def evaluate(self, inputs, targets=None, reduce=torch.argmax):
+        self.requires_grad_(False)
+        item_count = torch.tensor([len(inputs)]).reshape(1)
+        accuracy = torch.zeros(1)
+        loss = torch.zeros(1)
+        if targets is not None:
+            inputs = zip(inputs, targets)
+        with torch.no_grad():
+            for src, tgt in inputs:
+                out = self.forward(src).detach()
+                loss += self.loss(out, tgt)
+                accuracy += (reduce(out, dim=-1) == targets).sum()
+        loss.div_(item_count)
+        accuracy.div_(item_count)
+        return loss, accuracy
+
+
+class Classifier:
     """
     Store the knowledge related to the people faces
     """
@@ -147,7 +174,7 @@ class Classifier():
         self.epochs = epochs
         self.device = device if device is not None else (
                 torch.device('gpu:0') if torch.cuda.is_available() else torch.device(
-                    'cpu'))
+                        'cpu'))
         self.batch_size = 16192
 
     def init_classifier(self):
@@ -242,15 +269,13 @@ class Classifier():
                 X, Y, test_size=0.25)
 
         log.debug("train | Training ...")
-        loss = torch.nn.BCEWithLogitsLoss()
+        loss = -1
         for _ in range(self.epochs):
-            pass  # TODO: Train
-        self.classifier.fit(train_input, train_output)
-        log.debug("train | Model Trained!")
+            loss = self.classifier.fit(train_input, train_output)
+        log.debug(f"train | Model Trained. Loss: {loss}")
         log.debug("train | Checking performance ...")
-        y_pred = self.classifier.predict(test_input)
-        # Static method
-        self.verify_performance(test_output, y_pred)
+        loss, accuracy = self.classifier.predict(test_input)
+        print(f"test | Loss: {loss:.5f} - Accuracy: {accuracy:.5f}")
 
         return self.dump_model(timestamp=timestamp,
                                classifier=self.classifier), time.time() - start_time
@@ -292,7 +317,6 @@ class Classifier():
         log.info('Results on the test set: {}'.format(
                 pformat(grid.score(x_test, y_test))))
 
-        self.verify_performance(y_test, y_pred)
 
         return self.dump_model(timestamp=timestamp, params=grid.best_params_,
                                classifier=grid.best_estimator_), time.time() - \
@@ -301,21 +325,8 @@ class Classifier():
     @staticmethod
     def verify_performance(y_test, y_pred):
         """
-        Verify the performance of the result analyzing the known-predict result
-        :param y_test:
-        :param y_pred:
-        :return:
+        Do nothing. Left just in case it's used somewhere.
         """
-
-        log.debug("verify_performance | Analyzing performance ...")
-        log.info("\nClassification Report: {}".format(
-                pformat(classification_report(y_test, y_pred))))
-        log.info("balanced_accuracy_score: {}".format(
-                pformat(balanced_accuracy_score(y_test, y_pred))))
-        log.info("accuracy_score: {}".format(
-                pformat(accuracy_score(y_test, y_pred))))
-        log.info("precision_score: {}".format(
-                pformat(precision_score(y_test, y_pred, average='weighted'))))
 
     def dump_model(self, timestamp, classifier, params=None, path=None):
         """
